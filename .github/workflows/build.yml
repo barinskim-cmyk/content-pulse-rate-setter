@@ -43,7 +43,7 @@ jobs:
       - name: Build .exe
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name "Content Pulse Rate Setter" C1_RateSetter.py
+          pyinstaller --noconfirm --onefile --windowed --icon icon.ico --name "Content Pulse Rate Setter" C1_RateSetter.py
           Move-Item "dist/Content Pulse Rate Setter.exe" "dist/Content-Pulse-Rate-Setter-Windows.exe"
       - name: Smoke check
         shell: pwsh
