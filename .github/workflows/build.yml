@@ -1,0 +1,81 @@
+# Сборка Content Pulse Rate Setter: macOS .app + Windows .exe.
+# Релиз-тег latest обновляется при каждом запуске.
+# Запуск: push в main или вручную (gh workflow run build.yml)
+name: Build Rate Setter
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyinstaller
+      - name: Build .app
+        run: |
+          pyinstaller --noconfirm "C1 Rate Setter.spec"
+          codesign --force --deep -s - "dist/Content Pulse Rate Setter.app" || true
+          cd dist && ditto -c -k --keepParent "Content Pulse Rate Setter.app" "Content-Pulse-Rate-Setter-macOS.zip"
+      - name: Smoke check
+        run: test -d "dist/Content Pulse Rate Setter.app/Contents/MacOS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: dist/Content-Pulse-Rate-Setter-macOS.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyinstaller
+      - name: Build .exe
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "Content Pulse Rate Setter" C1_RateSetter.py
+          Move-Item "dist/Content Pulse Rate Setter.exe" "dist/Content-Pulse-Rate-Setter-Windows.exe"
+      - name: Smoke check
+        shell: pwsh
+        run: if (!(Test-Path "dist/Content-Pulse-Rate-Setter-Windows.exe")) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win
+          path: dist/Content-Pulse-Rate-Setter-Windows.exe
+
+  release:
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+          merge-multiple: true
+      - run: cp instruction.html art/instruction.html && ls art
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Content Pulse Rate Setter"
+          body: |
+            Rate Setter — ставит рейтинг 5* и ключевое слово SELECTED
+            в сессию Capture One по списку отобранных кадров.
+            - Content-Pulse-Rate-Setter-macOS.zip — для Mac (распаковать, при первом запуске: правый клик → Открыть)
+            - Content-Pulse-Rate-Setter-Windows.exe — для Windows
+            - instruction.html — инструкция
+          files: |
+            art/Content-Pulse-Rate-Setter-macOS.zip
+            art/Content-Pulse-Rate-Setter-Windows.exe
+            art/instruction.html
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
