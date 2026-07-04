@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Capture One Rate Setter — standalone-утилита.
 
-Ставит рейтинг 5 звёзд и ключевое слово SELECTED в .cos-файлы Capture One
-для фотографий, отобранных заказчиком/ретушёром.
+Ставит рейтинг 5 звёзд и ключевое слово SELECTED в настройки Capture One
+для фотографий, отобранных заказчиком/ретушёром. Поддерживаются и обычные
+сессии (.cos-файлы), и EIP-пакеты (.eip): EIP — это несжатый zip, внутри
+которого лежат RAW и те же .cos в CaptureOne/Settings<версия>/ — обновляем
+все версии настроек внутри пакета.
 
 Источник имён — папка с отобранными файлами ИЛИ список имён текстом.
 Список работает и с расширением на конце (IMG_0001.jpg), и без него
@@ -27,9 +30,12 @@ Cmd+V/C/X/A: у frozen-приложения нет меню «Правка», п
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sys
+import tempfile
+import zipfile
 import sqlite3
 import threading
 import xml.etree.ElementTree as ET
@@ -142,15 +148,19 @@ def collect_source_stems(source_dir: Path, strip_tails: bool = False) -> set[str
 # ── Работа с .cos ──
 
 def index_cos_by_photo_stem(root_dir: Path) -> dict[str, list[Path]]:
-    """Индекс: имя фото (без расширений) -> список путей к .cos.
+    """Индекс: имя фото (без расширений) -> список путей к .cos / .eip.
 
-    Имя .cos: <stem>.<ext>.cos, например IMG_0001.CR3.cos.
-    Двойной .stem убирает и .cos, и расширение фото.
+    Имя .cos: <stem>.<ext>.cos, например IMG_0001.CR3.cos —
+    двойной .stem убирает и .cos, и расширение фото.
+    Имя .eip: <stem>.eip — имя пакета и есть имя фото (RAW внутри
+    переименован в 0.<ext>, настройки лежат внутри пакета).
     """
     idx: dict[str, list[Path]] = {}
     for cos in root_dir.rglob("*.cos"):
         photo_stem = Path(cos.stem).stem
         idx.setdefault(photo_stem, []).append(cos)
+    for eip in root_dir.rglob("*.eip"):
+        idx.setdefault(eip.stem, []).append(eip)
     return idx
 
 
@@ -197,13 +207,17 @@ def _merge_keywords(raw: str, keywords: list[str]) -> tuple[str, bool]:
     return new, changed
 
 
-def update_cos(cos_path: Path, rating: str, keywords: list[str], backup: bool = True) -> tuple[bool, bool]:
-    """Проставить рейтинг и добавить ключевые слова в один .cos.
+def update_cos_xml(data: bytes, rating: str, keywords: list[str]) -> tuple[bytes | None, bool, bool]:
+    """Ядро правки настроек: принять XML .cos, вернуть обновлённый XML.
 
-    Пишет в слой AL (как сам Capture One). Чтение и запись — один раз.
-    Перед изменением создаётся .bak. Возвращает (рейтинг_изменён, ключевые_добавлены).
+    Пишет в слой AL (как сам Capture One).
+    Возвращает (новые_байты | None если без изменений, рейтинг_изменён, ключевые_добавлены).
+
+    Хвостовой NUL-паддинг (внутри EIP Capture One дополняет .cos нулями,
+    чтобы переписывать настройки на месте без пересборки пакета) срезается
+    перед парсингом.
     """
-    data = cos_path.read_bytes()
+    data = data.rstrip(b"\x00")
     try:
         root = ET.fromstring(data)
     except ET.ParseError as e:
@@ -235,14 +249,97 @@ def update_cos(cos_path: Path, rating: str, keywords: list[str], backup: bool = 
             else:
                 kw_elem.set("V", new_val)
 
-    if rating_changed or keyword_added:
+    if not (rating_changed or keyword_added):
+        return None, False, False
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True), rating_changed, keyword_added
+
+
+def update_cos(cos_path: Path, rating: str, keywords: list[str], backup: bool = True) -> tuple[bool, bool]:
+    """Проставить рейтинг и ключевые слова в один .cos (sidecar-файл сессии).
+
+    Перед изменением создаётся .bak. Возвращает (рейтинг_изменён, ключевые_добавлены).
+    """
+    data = cos_path.read_bytes()
+    new_data, rating_changed, keyword_added = update_cos_xml(data, rating, keywords)
+    if new_data is not None:
         if backup:
             bak = cos_path.with_suffix(cos_path.suffix + ".bak")
             if not bak.exists():
                 bak.write_bytes(data)
-        cos_path.write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
-
+        cos_path.write_bytes(new_data)
     return rating_changed, keyword_added
+
+
+# Настройки внутри EIP: CaptureOne/Settings<версия>/<имя>.cos
+EIP_COS_RE = re.compile(r"^CaptureOne/Settings\d+/.+\.cos$", re.IGNORECASE)
+
+
+def update_eip(eip_path: Path, rating: str, keywords: list[str], backup: bool = True) -> tuple[bool, bool]:
+    """Проставить рейтинг и ключевые слова внутрь EIP-пакета.
+
+    EIP — несжатый zip: RAW + .cos в CaptureOne/Settings<N>/ (по версии на
+    каждую версию C1, манифест указывает активную). Обновляем ВСЕ версии
+    настроек, чтобы сработало в любой версии Capture One.
+
+    Пакет пересобирается во временный файл и атомарно заменяет оригинал
+    (структуру и способ хранения записей сохраняем). Бэкап — маленький zip
+    '<имя>.eip.cosbak' с оригинальными .cos (не копия всего RAW).
+    Возвращает (рейтинг_изменён, ключевые_добавлены).
+    """
+    with zipfile.ZipFile(eip_path, "r") as zin:
+        entries = zin.infolist()
+        cos_entries = [i for i in entries if EIP_COS_RE.match(i.filename)]
+        if not cos_entries:
+            raise RuntimeError("внутри .eip не найдены настройки (CaptureOne/Settings*/*.cos)")
+
+        updated: dict[str, bytes] = {}
+        originals: dict[str, bytes] = {}
+        any_rating = any_kw = False
+        for info in cos_entries:
+            data = zin.read(info.filename)
+            new_data, r_ch, k_ch = update_cos_xml(data, rating, keywords)
+            if new_data is not None:
+                # сохранить паддинг: дополняем нулями до исходного размера,
+                # чтобы C1 мог по-прежнему править настройки на месте
+                if len(new_data) < len(data):
+                    new_data = new_data + b"\x00" * (len(data) - len(new_data))
+                updated[info.filename] = new_data
+                originals[info.filename] = data
+                any_rating = any_rating or r_ch
+                any_kw = any_kw or k_ch
+
+        if not updated:
+            return False, False
+
+        if backup:
+            bak = eip_path.with_suffix(eip_path.suffix + ".cosbak")
+            if not bak.exists():
+                with zipfile.ZipFile(bak, "w", zipfile.ZIP_DEFLATED) as zb:
+                    for name, data in originals.items():
+                        zb.writestr(name, data)
+
+        # Пересборка пакета: копируем записи как есть, подменяя обновлённые .cos
+        fd, tmp_name = tempfile.mkstemp(suffix=".eip.tmp", dir=str(eip_path.parent))
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(tmp_name, "w") as zout:
+                for info in entries:
+                    payload = updated.get(info.filename)
+                    if payload is None:
+                        payload = zin.read(info.filename)
+                    ni = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                    ni.compress_type = info.compress_type
+                    ni.external_attr = info.external_attr
+                    zout.writestr(ni, payload)
+            os.replace(tmp_name, eip_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    return any_rating, any_kw
 
 
 def process(source_stems: set[str], session_root: Path, log, keywords: list[str] | None = None) -> dict:
@@ -258,7 +355,7 @@ def process(source_stems: set[str], session_root: Path, log, keywords: list[str]
     for stem in sorted(source_stems):
         matches = cos_index.get(stem)
         if not matches:
-            log(f"НЕТ   {stem} — .cos не найден")
+            log(f"НЕТ   {stem} — .cos/.eip не найден")
             missing += 1
             continue
 
@@ -267,9 +364,10 @@ def process(source_stems: set[str], session_root: Path, log, keywords: list[str]
 
         for cos_path in matches:
             try:
-                rating_changed, keyword_added = update_cos(
-                    cos_path, RATING_VALUE, keywords
-                )
+                if cos_path.suffix.lower() == ".eip":
+                    rating_changed, keyword_added = update_eip(cos_path, RATING_VALUE, keywords)
+                else:
+                    rating_changed, keyword_added = update_cos(cos_path, RATING_VALUE, keywords)
                 if keyword_added:
                     tagged += 1
                 if rating_changed or keyword_added:
@@ -648,7 +746,7 @@ class App(tk.Tk):
         # 2) Папка сессии
         self._section_head(outer, "02", "ПАПКА СЕССИИ CAPTURE ONE").grid(
             row=4, column=0, sticky="w")
-        self._label(outer, "Корень сессии — *.cos ищутся по всем подпапкам:",
+        self._label(outer, "Корень сессии — *.cos и *.eip ищутся по всем подпапкам:",
                     fg=TEXT_2).grid(row=5, column=0, sticky="w", pady=(8, 6))
         sess = tk.Frame(outer, bg=BG)
         sess.grid(row=6, column=0, sticky="ew")
