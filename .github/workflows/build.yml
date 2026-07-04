@@ -13,20 +13,39 @@ permissions:
 
 jobs:
   mac:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: pip install pyinstaller
+      - name: Compile Tahoe icon (Assets.car + icns из RateSetter.icon)
+        run: |
+          mkdir -p iconbuild
+          xcrun actool "RateSetter.icon" --app-icon RateSetter \
+            --compile iconbuild \
+            --output-partial-info-plist iconbuild/partial.plist \
+            --minimum-deployment-target 11.0 --platform macosx --target-device mac
+          ls -la iconbuild
+          # свежий icns из actool заменяет наш ручной (единый источник)
+          test -f iconbuild/Assets.car
+          if [ -f iconbuild/RateSetter.icns ]; then cp iconbuild/RateSetter.icns icon.icns; fi
       - name: Build .app
         run: |
           pyinstaller --noconfirm "C1 Rate Setter.spec"
-          codesign --force --deep -s - "dist/Content Pulse Rate Setter.app" || true
+          APP="dist/Content Pulse Rate Setter.app"
+          # Tahoe-иконка нового формата: Assets.car + CFBundleIconName
+          cp iconbuild/Assets.car "$APP/Contents/Resources/"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string RateSetter" "$APP/Contents/Info.plist" \
+            || /usr/libexec/PlistBuddy -c "Set :CFBundleIconName RateSetter" "$APP/Contents/Info.plist"
+          codesign --force --deep -s - "$APP" || true
           cd dist && ditto -c -k --keepParent "Content Pulse Rate Setter.app" "Content-Pulse-Rate-Setter-macOS.zip"
       - name: Smoke check
-        run: test -d "dist/Content Pulse Rate Setter.app/Contents/MacOS"
+        run: |
+          test -d "dist/Content Pulse Rate Setter.app/Contents/MacOS"
+          test -f "dist/Content Pulse Rate Setter.app/Contents/Resources/Assets.car"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "dist/Content Pulse Rate Setter.app/Contents/Info.plist"
       - uses: actions/upload-artifact@v4
         with:
           name: mac
