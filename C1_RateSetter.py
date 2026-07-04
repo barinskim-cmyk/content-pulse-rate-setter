@@ -795,33 +795,55 @@ class App(tk.Tk):
     # физическим keycode ловит случаи, когда меню не перехватило.
 
     def _install_edit_shortcuts(self):
-        acc = "Command" if sys.platform == "darwin" else "Ctrl"
+        # ВАЖНО (macOS/Tk): формат акселератора — «Command-V» (через дефис),
+        # только тогда aqua-Tk вешает его как настоящий keyEquivalent меню.
+        darwin = sys.platform == "darwin"
+        acc = (lambda k: f"Command-{k}") if darwin else (lambda k: f"Ctrl+{k}")
         menubar = tk.Menu(self)
         edit = tk.Menu(menubar, tearoff=0)
-        edit.add_command(label="Вырезать", accelerator=f"{acc}+X",
+        edit.add_command(label="Вырезать", accelerator=acc("X"),
                          command=lambda: self._edit_action("cut"))
-        edit.add_command(label="Копировать", accelerator=f"{acc}+C",
+        edit.add_command(label="Копировать", accelerator=acc("C"),
                          command=lambda: self._edit_action("copy"))
-        edit.add_command(label="Вставить", accelerator=f"{acc}+V",
+        edit.add_command(label="Вставить", accelerator=acc("V"),
                          command=lambda: self._edit_action("paste"))
         edit.add_separator()
-        edit.add_command(label="Выделить всё", accelerator=f"{acc}+A",
+        edit.add_command(label="Выделить всё", accelerator=acc("A"),
                          command=lambda: self._edit_action("selectall"))
         menubar.add_cascade(label="Правка", menu=edit)
         self.config(menu=menubar)
 
-        if sys.platform == "darwin":
-            # Фолбэк: физические keycode клавиш V/C/X/A на macOS
-            # (не зависят от раскладки). Латинские keysym пропускаем —
-            # их обрабатывает меню или родной биндинг (иначе двойная вставка).
+        if darwin:
+            # Забираем шорткаты полностью на себя: родные класс-биндинги
+            # (<<Paste>> и т.п.) во frozen-сборке не срабатывают, а если
+            # оставить их и добавить свои — рискуем двойной вставкой.
+            # Поэтому: (1) снимаем стандартные привязки виртуальных событий,
+            # (2) ловим Command-KeyPress на bind_all и обрабатываем сами —
+            # и латиницу, и кириллицу (по keysym), и любые раскладки (по keycode).
+            for ve, seqs in ((r"<<Paste>>", ("<Command-v>", "<Command-V>")),
+                             (r"<<Copy>>", ("<Command-c>", "<Command-C>")),
+                             (r"<<Cut>>", ("<Command-x>", "<Command-X>")),
+                             (r"<<SelectAll>>", ("<Command-a>", "<Command-A>"))):
+                for seq in seqs:
+                    try:
+                        self.event_delete(ve, seq)
+                    except tk.TclError:
+                        pass
             self.bind_all("<Command-KeyPress>", self._on_cmd_key, add="+")
 
+    # Физические keycode V/C/X/A на macOS — не зависят от раскладки
     _MAC_KEYCODES = {9: "paste", 8: "copy", 7: "cut", 0: "selectall"}
+    _KEYSYM_ACTIONS = {
+        "v": "paste", "cyrillic_em": "paste",
+        "c": "copy", "cyrillic_es": "copy",
+        "x": "cut", "cyrillic_che": "cut",
+        "a": "selectall", "cyrillic_ef": "selectall",
+    }
 
     def _on_cmd_key(self, event):
-        if event.keysym.lower() in ("v", "c", "x", "a"):
-            return None  # латиница — обработает меню/класс-биндинг
-        action = self._MAC_KEYCODES.get(event.keycode)
+        action = self._KEYSYM_ACTIONS.get(event.keysym.lower())
+        if action is None:
+            action = self._MAC_KEYCODES.get(event.keycode)
         if action:
             self._edit_action(action)
             return "break"
